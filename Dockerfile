@@ -1,73 +1,75 @@
-# syntax = docker/dockerfile:1.5
+ARG UBUNTU_VERSION=22.04
+# This needs to generally match the container host's environment.
+ARG CUDA_VERSION=11.7.1
+# Target the CUDA build image
+ARG BASE_CUDA_DEV_CONTAINER=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+# Target the CUDA runtime image
+ARG BASE_CUDA_RUN_CONTAINER=nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION}
 
-FROM tabbyml/fastertransformer_backend
+FROM ${BASE_CUDA_DEV_CONTAINER} as build
 
-RUN apt update && apt -y install build-essential libssl-dev zlib1g-dev \
-  libbz2-dev libreadline-dev libsqlite3-dev curl \
-  libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
+# Rust toolchain version
+ARG RUST_TOOLCHAIN=stable
 
-RUN mkdir -p /home/app
-RUN chown 1000 /home/app
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        pkg-config \
+        libssl-dev \
+        protobuf-compiler \
+        git \
+        cmake \
+        && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-USER 1000
-WORKDIR /home/app
-ENV HOME /home/app
+# setup rust.
+RUN curl https://sh.rustup.rs -sSf | bash -s -- --default-toolchain ${RUST_TOOLCHAIN} -y
+ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Setup pyenv
-RUN git clone --depth=1 https://github.com/pyenv/pyenv.git .pyenv
-ENV PATH="$HOME/.pyenv/shims:/home/app/.pyenv/bin:$PATH"
+WORKDIR /root/workspace
 
-ARG PYTHON_VERSION=3.10.10
-RUN pyenv install ${PYTHON_VERSION}
-RUN pyenv global ${PYTHON_VERSION}
+RUN mkdir -p /opt/tabby/bin
+RUN mkdir -p /opt/tabby/lib
+RUN mkdir -p target
 
-ARG PYPI_INDEX_URL=https://pypi.org/simple
-ARG POETRY_VERSION=1.4.0
+COPY . .
 
-RUN --mount=type=cache,target=$HOME/.cache pip install -i $PYPI_INDEX_URL "poetry==$POETRY_VERSION"
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/root/workspace/target \
+    cargo build --features cuda --release --package tabby && \
+    cp target/release/tabby /opt/tabby/bin/
 
-# vector
-RUN <<EOF
-curl --proto '=https' --tlsv1.2 -sSf https://sh.vector.dev | bash -s -- -y
-EOF
-ENV PATH "$HOME/.vector/bin:$PATH"
+FROM ${BASE_CUDA_RUN_CONTAINER} as runtime
 
-# Supervisord
-RUN --mount=type=cache,target=$HOME/.cache pip install -i $PYPI_INDEX_URL supervisor
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git \
+        openssh-client \
+        ca-certificates \
+        && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p ~/.bin
-ENV PATH "$HOME/.bin:$PATH"
+# Disable safe directory in docker
+# Context: https://github.com/git/git/commit/8959555cee7ec045958f9b6dd62e541affb7e7d9
+RUN git config --system --add safe.directory "*"
 
-# Install dagu
-RUN <<EOF
-  curl -L https://github.com/yohamta/dagu/releases/download/v1.10.2/dagu_1.10.2_Linux_x86_64.tar.gz > dagu.tar.gz
-  tar zxvf dagu.tar.gz
-  mv dagu ~/.bin/
-  rm dagu.tar.gz LICENSE.md README.md
-EOF
+# Automatic platform ARGs in the global scope
+# https://docs.docker.com/engine/reference/builder/#automatic-platform-args-in-the-global-scope
+ARG TARGETARCH
 
-# Install tabby dependencies
-COPY poetry.lock pyproject.toml ./
-RUN poetry export --without-hashes > requirements.txt
-RUN --mount=type=cache,target=$HOME/.cache pip install -i $PYPI_INDEX_URL --no-dependencies -r requirements.txt
+# AMD64 only:
+# Make link to libnvidia-ml.so (NVML) library
+# so that we could get GPU stats.
+RUN if [ "$TARGETARCH" = "amd64" ]; then  \
+    ln -s /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1 \
+        /usr/lib/x86_64-linux-gnu/libnvidia-ml.so; \
+    fi
 
-COPY tabby ./tabby
+COPY --from=build /opt/tabby /opt/tabby
 
-# Install caddy
-RUN <<EOF
-  curl -L "https://github.com/caddyserver/caddy/releases/download/v2.6.4/caddy_2.6.4_linux_amd64.tar.gz" -o caddy.tar.gz
-  tar zxvf caddy.tar.gz
-  mv caddy ~/.bin/
-  rm caddy.tar.gz README.md LICENSE
-EOF
+ENV TABBY_ROOT=/data
 
-# Setup file permissions
-USER root
-RUN mkdir -p /var/lib/vector
-RUN chown 1000 /var/lib/vector
-
-RUN mkdir -p $HOME/.cache
-RUN chown 1000 $HOME/.cache
-
-USER 1000
-CMD ["./tabby/scripts/tabby.sh"]
+ENTRYPOINT ["/opt/tabby/bin/tabby"]

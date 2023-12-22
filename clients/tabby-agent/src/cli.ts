@@ -3,7 +3,7 @@
 import { TabbyAgent } from "./TabbyAgent";
 import { StdIO } from "./StdIO";
 
-const agent = new TabbyAgent();
 const stdio = new StdIO();
+const agent = new TabbyAgent();
 stdio.bind(agent);
 stdio.listen();

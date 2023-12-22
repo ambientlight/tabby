@@ -3,5 +3,8 @@ name = "tabby-coreml"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+objc = "0.2.7"
+
 [build-dependencies]
 cc = "1.0"

@@ -2,15 +2,23 @@ name: Create and publish docker image
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 20 */1 * *'
   push:
-    branches: [ "main" ]
-    paths:
-      - 'poetry.lock'
-      - 'tabby/**'
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }} 
+  
+  # If this is enabled it will cancel current running and start latest
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: 1.73.0
 
 jobs:
-  build:
-
+  release-docker:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -37,6 +45,8 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v3
+        with:
+          submodules: recursive
 
       # Workaround: https://github.com/docker/build-push-action/issues/461
       - name: Setup Docker buildx
@@ -45,7 +55,6 @@ jobs:
       # Login against a Docker registry except on PR
       # https://github.com/docker/login-action
       - name: Log into GitHub Container registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v2.0.0
         with:
           registry: ghcr.io
@@ -53,7 +62,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Log into Docker Hub
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v2.0.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -68,6 +76,21 @@ jobs:
         with:
           image: ghcr.io/${{ env.IMAGE_NAME }}/cache
 
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          # list of Docker images to use as base name for tags
+          images: |
+            ghcr.io/${{ env.IMAGE_NAME }}
+            ${{ env.IMAGE_NAME }}
+          # generate Docker tags based on the following events/attributes
+          tags: |
+            type=raw,value={{branch}}-{{sha}},enable=${{ startsWith(github.ref, 'refs/heads') }}
+            type=schedule,pattern=nightly
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=semver,pattern={{version}}
+
       # Build and push Docker image with Buildx (don't push on PR)
       # https://github.com/docker/build-push-action
       - name: Build and push Docker image
@@ -75,13 +98,13 @@ jobs:
         uses: docker/build-push-action@v3.1.1
         with:
           file: Dockerfile
+          push: true
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: |
-            ghcr.io/${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: ${{ steps.cache.outputs.cache-from }}
           cache-to: ${{ steps.cache.outputs.cache-to }}
+          build-args: RUST_TOOLCHAIN=${{ env.RUST_TOOLCHAIN }}
 
       - name: Docker Hub Description
         uses: peter-evans/dockerhub-description@v3
@@ -89,3 +112,4 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: tabbyml/tabby
+

@@ -1,26 +1,33 @@
-POETRY_EXISTS := $(shell which poetry &> /dev/null)
-PRE_COMMIT_EXISTS := $(shell poetry run which pre-commit &> /dev/null)
-PRE_COMMIT_HOOK := .git/hooks/pre-commit
+fix:
+	cargo machete --fix || true
+	cargo +nightly fmt
+	cargo +nightly clippy --fix --allow-dirty --allow-staged
 
-pre-commit: setup-development-environment
-	poetry run pre-commit
+fix-ui:
+	cd ee/tabby-ui && yarn format:write && yarn lint:fix
 
-install-poetry:
-ifndef POETRY_EXISTS
-	curl -sSL https://install.python-poetry.org | POETRY_VERSION=1.4.0 python3 -
-endif
+update-ui:
+	cd ee/tabby-ui && yarn build
+	rm -rf ee/tabby-webserver/ui && cp -R ee/tabby-ui/out ee/tabby-webserver/ui
 
-ifndef PRE_COMMIT_EXISTS
-	poetry run pip install $(shell poetry export --without-hashes --with dev | grep pre-commit | cut -d";" -f1)
-endif
+bump-version:
+	cargo ws version --no-git-tag --force "*"
 
-$(PRE_COMMIT_HOOK):
-	poetry run pre-commit install --install-hooks
+bump-release-version:
+	cargo ws version --allow-branch "r*" --no-individual-tags --force "*"
 
-setup-development-environment: install-poetry $(PRE_COMMIT_HOOK)
+update-openapi-doc:
+	curl http://localhost:8080/api-docs/openapi.json | jq '                                                             \
+	  delpaths([                                                                                                        \
+		  ["paths", "/v1beta/chat/completions"],                                                                    \
+		  ["paths", "/v1beta/search"],                                                                              \
+		  ["components", "schemas", "CompletionRequest", "properties", "prompt"],                                   \
+		  ["components", "schemas", "CompletionRequest", "properties", "debug_options"],                            \
+		  ["components", "schemas", "CompletionResponse", "properties", "debug_data"],                              \
+		  ["components", "schemas", "DebugData"],                                                                   \
+			["components", "schemas", "DebugOptions"]                                                                 \
+			])' | jq '.servers[0] |= { url: "https://playground.app.tabbyml.com", description: "Playground server" }' \
+			    > website/static/openapi.json
 
-smoke:
-	k6 run tests/*.smoke.js
-
-loadtest:
-	k6 run tests/*.loadtest.js
+update-graphql-schema:
+	cargo run --package tabby-webserver --example update-schema

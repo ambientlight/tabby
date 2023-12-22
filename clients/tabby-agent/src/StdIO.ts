@@ -1,126 +1,125 @@
-import { CancelablePromise } from "./generated";
-import { AgentFunction, AgentEvent, Agent, agentEventNames } from "./types";
-import { splitLines } from "./utils";
+import readline from "readline";
+import { AgentFunction, AgentEvent, Agent, agentEventNames } from "./Agent";
+import { rootLogger } from "./logger";
+import { isCanceledError } from "./utils";
 
 type AgentFunctionRequest<T extends keyof AgentFunction> = [
   id: number,
   data: {
     func: T;
     args: Parameters<AgentFunction[T]>;
-  }
-]
+  },
+];
 
 type CancellationRequest = [
   id: number,
   data: {
     func: "cancelRequest";
     args: [id: number];
-  }
-]
+  },
+];
 
-type Request = AgentFunctionRequest<any> | CancellationRequest;
+type StdIORequest = AgentFunctionRequest<keyof AgentFunction> | CancellationRequest;
 
 type AgentFunctionResponse<T extends keyof AgentFunction> = [
   id: number, // Matched request id
-  data: ReturnType<AgentFunction[T]>,
-]
+  data: ReturnType<AgentFunction[T]> | null,
+];
 
-type AgentEventNotification = {
-  id: 0,
+type AgentEventNotification = [
+  id: 0, // Always 0
   data: AgentEvent,
-}
+];
 
 type CancellationResponse = [
   id: number, // Matched request id
-  data: boolean,
-]
+  data: boolean | null,
+];
 
-type Response = AgentFunctionResponse<any> | AgentEventNotification | CancellationResponse;
+type StdIOResponse = AgentFunctionResponse<keyof AgentFunction> | AgentEventNotification | CancellationResponse;
 
 /**
  * Every request and response should be single line JSON string and end with a newline.
  */
 export class StdIO {
+  private readonly process: NodeJS.Process = process;
   private readonly inStream: NodeJS.ReadStream = process.stdin;
   private readonly outStream: NodeJS.WriteStream = process.stdout;
-  private readonly errLogger: NodeJS.WriteStream = process.stderr;
+  private readonly logger = rootLogger.child({ component: "StdIO" });
 
-  private buffer: string = "";
-  private ongoingRequests: { [id: number]: CancelablePromise<any> } = {};
+  private abortControllers: { [id: string]: AbortController } = {};
 
-  private agent: Agent | null = null;
+  private agent?: Agent;
 
-  constructor() {
-  }
+  constructor() {}
 
-  private handleInput(data: Buffer): void {
-    const input = data.toString();
-    this.buffer += input;
-    const lines = splitLines(this.buffer);
-    if (lines.length < 1) {
+  private async handleLine(line: string) {
+    let request: StdIORequest;
+    try {
+      request = JSON.parse(line) as StdIORequest;
+    } catch (error) {
+      this.logger.error({ error }, `Failed to parse request: ${line}`);
       return;
     }
-    if (lines[lines.length - 1].endsWith("\n")) {
-      this.buffer = "";
-    } else {
-      this.buffer = lines.pop()!;
-    }
-    for (const line of lines) {
-      let request: Request | null = null;
-      try {
-        request = JSON.parse(line) as Request;
-      } catch (e) {
-        this.errLogger.write(JSON.stringify(e, Object.getOwnPropertyNames(e)) + "\n");
-        continue;
-      }
-      this.handleRequest(request).then((response) => {
-        this.sendResponse(response);
-      });
-    }
+    this.logger.debug({ request }, "Received request");
+    const response = await this.handleRequest(request);
+    this.sendResponse(response);
+    this.logger.debug({ response }, "Sent response");
   }
 
-  private async handleRequest(request: Request): Promise<Response> {
-    const response: Response = [0, null];
+  private async handleRequest(request: StdIORequest): Promise<StdIOResponse> {
+    let requestId: number = 0;
+    const response: StdIOResponse = [0, null];
+    const abortController = new AbortController();
     try {
       if (!this.agent) {
         throw new Error(`Agent not bound.\n`);
       }
-      response[0] = request[0];
+      requestId = request[0];
+      response[0] = requestId;
 
-      let funcName = request[1].func;
+      const funcName = request[1].func;
       if (funcName === "cancelRequest") {
         response[1] = this.cancelRequest(request as CancellationRequest);
       } else {
-        let func = this.agent[funcName];
+        const func = this.agent[funcName];
         if (!func) {
           throw new Error(`Unknown function: ${funcName}`);
         }
-        const result = func.apply(this.agent, request[1].args);
-        if (result instanceof CancelablePromise) {
-          this.ongoingRequests[request[0]] = result;
-          response[1] = await result;
-          delete this.ongoingRequests[request[0]];
-        } else {
-          response[1] = result;
+        const args = request[1].args;
+        // If the last argument is an object and has `signal` property, replace it with the abort signal.
+        if (args.length > 0 && typeof args[args.length - 1] === "object" && args[args.length - 1]["signal"]) {
+          this.abortControllers[requestId] = abortController;
+          args[args.length - 1]["signal"] = abortController.signal;
         }
+        // @ts-expect-error TS2684: FIXME
+        response[1] = await func.apply(this.agent, args);
       }
-    } catch (e) {
-      this.errLogger.write(JSON.stringify(e, Object.getOwnPropertyNames(e)) + "\n");
+    } catch (error) {
+      if (isCanceledError(error)) {
+        this.logger.debug({ error, request }, `Request canceled`);
+      } else {
+        this.logger.error({ error, request }, `Failed to handle request`);
+      }
     } finally {
-      return response;
+      if (this.abortControllers[requestId]) {
+        delete this.abortControllers[requestId];
+      }
     }
+    return response;
   }
 
   private cancelRequest(request: CancellationRequest): boolean {
-    const ongoing = this.ongoingRequests[request[1].args[0]];
-    if (!ongoing) {
-      return false;
+    const targetId = request[1].args[0];
+    const controller = this.abortControllers[targetId];
+    if (controller) {
+      controller.abort();
+      return true;
     }
-    ongoing.cancel();
-    return true;
+    return false;
   }
 
-  private sendResponse(response: Response): void {
+  private sendResponse(response: StdIOResponse): void {
     this.outStream.write(JSON.stringify(response) + "\n");
   }
 
@@ -129,11 +128,22 @@ export class StdIO {
     for (const eventName of agentEventNames) {
       this.agent.on(eventName, (event) => {
         this.sendResponse([0, event]);
-      })
+      });
     }
   }
 
   listen() {
-    this.inStream.on("data", this.handleInput.bind(this));
+    readline.createInterface({ input: this.inStream }).on("line", (line) => {
+      this.handleLine(line);
+    });
+
+    ["SIGTERM", "SIGINT"].forEach((sig) => {
+      this.process.on(sig, async () => {
+        if (this.agent && this.agent.getStatus() !== "finalized") {
+          await this.agent.finalize();
+        }
+        this.process.exit(0);
+      });
+    });
   }
 }
